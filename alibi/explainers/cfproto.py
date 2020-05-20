@@ -1,4 +1,5 @@
 # flake8: noqa F841
+print('AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA')
 
 import copy
 import logging
@@ -53,312 +54,11 @@ from sklearn.preprocessing import normalize
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 
 
-class CustomDataGenerator(Sequence):
-    
-    def __init__(self, data_path, batch_size, data_index, shuffle, steps_per_epoch):
-        '''
-        data: dictionary of data, each key is a multivariate time serie
-        window_length: length of the window in which the time series are going to be divided
-        n_instances = number of instances
-        shuffle: boolean (True -> shuffle the data, False -> dont shuffle)
-        indexes: list of indexes
-        batch_size: batch size
-        '''
-        self.data_path = data_path
-        self.shuffle = shuffle
-        self.data_index = data_index
-        self.batch_size = batch_size
-        self.steps_per_epoch = steps_per_epoch
-    
-    def __len__(self):
-        """ Method called at the time of requiring the number of batches per epoch
-
-            Returns:
-                int: number of batches per epoch
-
-        """
-        return self.steps_per_epoch
-    
-    def on_epoch_end(self):
-        """ Method called at the end of every epoch.
-            shuffle data to avoid the network from learning the order of the data
-        """
-        if self.shuffle == True:
-            np.random.shuffle(self.data_index)
-            
-    def __getitem__(self, idx):
-        'Generate one batch of data'
-        start_point = self.batch_size * idx
-        stop_point = start_point + self.batch_size
-        
-        # the last batch may have less instances
-        if (idx + 1) == self.steps_per_epoch:
-            stop_point = len(self.data_index)
-        
-        # h5py only supports ascending indexing
-        index_list = np.sort(self.data_index[start_point:stop_point])
-        h5f = h5py.File(self.data_path, 'r')
-        X = h5f['X_df'][index_list,:,:]
-        return X,X
-    
-
-def attention_3d_block(hidden_states_encoder,hidden_states_decoder):
-    # hidden_states.shape = (batch_size, time_steps, hidden_size)
-    hidden_size = int(hidden_states_encoder.shape[2])
-    # Inside dense layer
-    #              hidden_states            dot               W            =>           score_first_part
-    # (batch_size, time_steps, hidden_size) dot (hidden_size, hidden_size) => (batch_size, time_steps, hidden_size)
-    # W is the trainable weight matrix of attention
-    # Luong's multiplicative style score
-    score_first_part = Dense(hidden_size, use_bias=False, name='attention_score_vec')(hidden_states_encoder)
-    #            score_first_part           dot        last_hidden_state     => attention_weights
-    # (batch_size, time_steps, hidden_size) dot   (batch_size, hidden_size)  => (batch_size, time_steps)
-
-
-    #SHAPES:
-        #HIDDEN_STATE_ENCODER = 14(time steps) x 128 (hidden_size)
-        #HIDDEN_STATE_DECODER = 14(time steps) x 128 (hidden_size)
-        
-    hidden_states_decoder = Permute((2, 1))(hidden_states_decoder) 
-    score = dot([score_first_part, hidden_states_decoder], [2,1], name='attention_score')
-    attention_weights = Activation('softmax', name='attention_weight')(score)
-    
-    # (batch_size, time_steps, hidden_size) dot (batch_size, time_steps) => (batch_size, hidden_size)
-    context_vector = dot([hidden_states_encoder, attention_weights], [1, 1], name='context_vector')
-    context_vector = Permute((2, 1))(context_vector)
-#     pre_activation = concatenate([context_vector, hidden_states_decoder], name='attention_output')
-    attention_vector = Dense(15, use_bias=False, activation='tanh',
-                             name='attention_vector')(context_vector)
-    return attention_vector
-
-def seq2seqAttention(rnn_layer_type, n_rnn_units, return_sequences,x,input_dim,name):
-    encoder = get_recurrent_layer(rnn_layer_type, n_rnn_units, return_sequences, x)
-    last_hidden_state = Lambda(lambda x: x[:, -1, :], output_shape=(encoder.shape[0],), name='last_hidden_state')(
-        encoder)  
-    x = RepeatVector(encoder.shape[1])(last_hidden_state)
-    decoder = get_recurrent_layer(rnn_layer_type, n_rnn_units, return_sequences, x)
-    attention_mul = attention_3d_block(encoder,decoder)
-    return attention_mul,last_hidden_state
-
-
-def generate_LSTM_Autoencoder_with_Attention(time_steps,n_units,learning_rate,window_length):
-
-    input_layer = Input((30,15))
-    input_dim = input_layer.shape[2]
-    x,z = seq2seqAttention('LSTM', n_units, True,input_layer,input_dim,'seq2seq')
-    lstm_autoencoder_model = Model(input_layer, x)
-    encoder_model = Model(input_layer, z)
-    lstm_autoencoder_model.summary()
-    adam = Adam(lr = learning_rate)
-    lstm_autoencoder_model.compile(optimizer=adam, loss='mse')
-
-    return encoder_model,lstm_autoencoder_model
-
-
-def get_recurrent_layer(rnn_layer_type, n_rnn_units, return_sequences, input_tensor):
-    """ generate the specified recurrent layer type
-
-        Args:
-            rnn_layer_type (string): the type of the recurrent layer (LSTM, Bi-LSTM, GRU, Bi-GRU, SimpleRNN)
-            n_rnn_units (int): number of units on each recurrent layer
-            return_sequences (bool): whether to return the sequence or not
-            input_tensor (tensor): input tensor of the corresponding layer
-
-        Returns:
-            keras.layers: recurrent layer of required type
-
-    """
-    if rnn_layer_type == 'LSTM':
-        rnn_layer = LSTM(units=n_rnn_units, return_sequences=return_sequences)(input_tensor)
-    elif rnn_layer_type == 'Bi-LSTM':
-        rnn_layer = Bidirectional(LSTM(units=n_rnn_units, return_sequences=return_sequences))(input_tensor)
-    elif rnn_layer_type == 'GRU':
-        rnn_layer = GRU(units=n_rnn_units, return_sequences=return_sequences)(input_tensor)
-    elif rnn_layer_type == 'Bi-GRU':
-        rnn_layer = Bidirectional(GRU(units=n_rnn_units, return_sequences=return_sequences))(input_tensor)
-    elif rnn_layer_type == 'SimpleRNN':
-        rnn_layer = SimpleRNN(units=n_rnn_units, return_sequences=return_sequences)(input_tensor)
-    else:
-        warnings.warn('Job aborted! Please, set a valid recurrent layer type (LSTM, Bi-LSTM, GRU, Bi-GRU, SimpleRNN)')
-        raise SystemExit
-
-    return rnn_layer
-
-n_sensors,time_steps,window_length,batch_size,rnn_layer_type,n_units = 15,30,30,64,'LSTM',32
 
 if TYPE_CHECKING:  # pragma: no cover
     import keras
 
-logger = logging.getLogger(__name__)
-
-encoder, ae = generate_LSTM_Autoencoder_with_Attention(time_steps,n_units,learning_rate,window_length)
-ae = load_model('/data/jlabaien/PHD/Turbofan/Model/lstmAEwithATT_model.h5')
-encoder.set_weights(ae.get_weights()[:3])
-
-class GetProjectionsTrain():
-    
-    def __init__(self, n_groups, z_path = '/data/jlabaien/PHD/Turbofan/Model/LatentSpace_unsupervised_attAE.h5', plot_space = True):
-        
-        self.n_groups = n_groups
-        self.plot_space = plot_space
-        with h5py.File('/data/jlabaien/PHD/Turbofan/Model/LatentSpace_unsupervised_attAE.h5', 'r') as hf:
-            self.encoded_features = hf['x_df'][:]
-            self.data_y = hf['y_df'][:]
-            
-    def PCA(self,):
-        
-        feat_cols = [ 'sample'+str(i) for i in range(self.encoded_features.shape[1]) ]
-        df = pd.DataFrame(self.encoded_features,columns=feat_cols)
-
-        #PCA
-        pca = PCA(n_components=3)
-        pca_fitted = pca.fit(df[feat_cols].values)
-        pca_result = pca.fit_transform(df[feat_cols].values)
-
-        df['pca-one'] = pca_result[:,0]
-        df['pca-two'] = pca_result[:,1] 
-        df['pca-three'] = pca_result[:,2]
-        df['y'] = self.data_y
-        
-        return pca_fitted, pca_result,df
-    
-    def pc1_split_and_mean(self,pca_result):
-        min_pc1 = min(pca_result[:,0])
-        max_pc1 = max(pca_result[:,0])
-        split = (max_pc1-min_pc1)/self.n_groups
-        index_list = []
-        for i in range(self.n_groups + 1):
-            index_list.append(np.where((pca_result[:,0] > min_pc1+split*i -split/2) & (pca_result[:,0] <= min_pc1+split*(i+1)-split/2)))
-        return index_list
-    
-    def get_prototypes(self,group_indexes):
-        prototypes = np.zeros((len(group_indexes),self.encoded_features.shape[1]))
-        for i in range(len(group_indexes)):
-            prototypes[i] = np.mean(self.encoded_features[group_indexes[i][0]],axis=0)
-        return prototypes
-    
-    def get_regression_line(self,prototypes_pca):
-        m,b = np.polyfit(prototypes_pca[:,0], prototypes_pca[:,1], 1)
-        line = LineString([(0,0*m+b), (1, 1*m+b)])
-        return m,b,line
-    
-    def orthogonal_projection(self,pt):
-        point = Point(pt[0], pt[1])
-        x = np.array(point.coords[0])
-        n = self.v - self.u
-        n /= np.linalg.norm(n, 2)
-        P = self.u + n*np.dot(x - self.u, n)
-
-        return P
-    
-    def visualize(self,df,prototypes_pca,projection_pc,projection_prototypes,m,b):
-        fig = plt.figure(figsize=(16,7))
-        ax1 = plt.subplot(1, 1, 1)
-        sns.scatterplot(
-            x="pca-one", y="pca-two",
-            hue="y",
-            palette=sns.color_palette("hls", 4),
-            data=df,
-            legend="full",
-            alpha=0.3,
-            ax=ax1
-        )
-        plt.scatter(prototypes_pca[:,0],prototypes_pca[:,1],marker = 'D',color = 'black')
-        plt.plot(np.linspace(-1,1.2,100), m*np.linspace(-1,1.2,100)+ b,color = 'orange', linewidth=3.0)
-
-        plt.scatter(projection_pc[:,0],projection_pc[:,1],marker = '+',color = 'blue',s =100)
-        plt.scatter(projection_prototypes[:,0],projection_prototypes[:,1],marker = '+',color = 'red',s =200)
-        return fig
-    
-    def main(self,):
-        pca_fitted, pca_result,df = self.PCA()
-        group_indexes = self.pc1_split_and_mean(pca_result)
-        prototypes = self.get_prototypes(group_indexes)
-        prototypes_pca = pca_fitted.fit_transform(prototypes)
-        m,b,line = self.get_regression_line(prototypes_pca)
-        self.u = np.array(line.coords[0])
-        self.v = np.array(line.coords[len(line.coords)-1])
-        projection_pc = np.apply_along_axis(self.orthogonal_projection, 1, pca_result[:,0:2])
-        projection_prototypes = np.apply_along_axis(self.orthogonal_projection, 1, prototypes_pca[:,0:2])
-        
-        if self.plot_space:
-            fig = self.visualize(df,prototypes_pca,projection_pc,projection_prototypes,m,b)
-
-        return pca_fitted, projection_pc, projection_prototypes, line, pca_result, prototypes_pca,fig,prototypes
-
-trainer = GetProjectionsTrain(n_groups = 10)
-
-pca_fitted, projection_pc, projection_prototypes, line, pca_result, prototypes_pca,fig = trainer.main()
-
-class TubofanUnsupervisedClassifier():
-    '''
-    This classifier takes as input MVTS from Turbofan dataset and returns a value corresponding the state
-    in which this time series is in that moment.
-    '''
-    def __init__(self, pca_fitted, projection_pc, projection_proto, line, encoder,test_points):
-        '''
-        pca: principal components of encoded training features
-        projection_pc: projection of encoded
-        '''
-        self.encoder = encoder
-        self.pca_fitted = pca_fitted
-        self.projection_pc = projection_pc
-        self.projection_proto = projection_proto
-        self.line = line
-        self.test_points = test_points
-        
-        
-    def softmax(self,x, axis = 0):
-        e_x = np.exp(x - np.max(x, axis = axis, keepdims = True))
-        return e_x / e_x.sum(axis, keepdims = True)
-    
-    def compute_distance_value(self,prototypes,point):
-        n_prototypes = len(prototypes)
-        distance_values = np.zeros(len(prototypes))
-        for i in range(len(prototypes)):
-            dist = np.abs(prototypes[i]-point)
-            distance_values[i] = 1/dist[0]
-        return self.softmax(distance_values)
-    
-    def classifier(self,projected_points):
-        probs = np.zeros((projected_points.shape[0],self.projection_proto.shape[0]))
-        predicted_labels = np.zeros(projected_points.shape[0])
-        for i in range(projected_points.shape[0]):
-            probs[i,:] = self.compute_distance_value(self.projection_proto,projected_points[i])
-            predicted_labels[i] = np.argmax(probs[i,:])
-        return probs, predicted_labels
-    
-    def orthogonal_projection(self,pt):
-        point = Point(pt[0], pt[1])
-        x = np.array(point.coords[0])
-        n = self.v - self.u
-        n /= np.linalg.norm(n, 2)
-        P = self.u + n*np.dot(x - self.u, n)
-
-        return P
-    
-    def main(self,):
-        z = self.encoder.predict(self.test_points)
-        z_pca = self.pca_fitted.fit_transform(z)
-        self.u = np.array(line.coords[0])
-        self.v = np.array(line.coords[len(line.coords)-1])
-        projection_z_pca = np.apply_along_axis(self.orthogonal_projection, 1, z_pca[:,0:2])
-        probs, preds = self.classifier(projection_z_pca)
-        return probs, preds, projection_z_pca,z_pca,z
-
-data_path = '/data/jlabaien/PHD/Turbofan/AllData_FD001_4_splits.h5'
-
-with h5py.File(data_path, 'r') as hf:
-    test_points = hf['X_df'][:]
-
-test = TubofanUnsupervisedClassifier(pca_fitted, projection_pc, projection_prototypes, line, encoder,test_points)
-
-probs, preds, projection_z_pca,z_pca,z = test.main()
-
-def predictor(pca_fitted, projection_pc, projection_prototypes, line, encoder,test_points):
-    test = TubofanUnsupervisedClassifier(pca_fitted, projection_pc, projection_prototypes, line, encoder,test_points)
-    probs, preds, projection_z_pca,z_pca = test.main()
-    return probs, preds, projection_z_pca,z_pca,z
+# logger = logging.getLogger(__name__)
 
 
 class CounterFactualProto(Explainer, FitMixin):
@@ -458,9 +158,10 @@ class CounterFactualProto(Explainer, FitMixin):
         self.predict = predict
 
         # check whether the model, encoder and auto-encoder are Keras or TF models and get session
-        is_model, is_model_keras, model_sess = _check_keras_or_tf(predict)
+
         is_ae, is_ae_keras, ae_sess = _check_keras_or_tf(ae_model)
         is_enc, is_enc_keras, enc_sess = _check_keras_or_tf(enc_model)
+        is_model, is_model_keras, model_sess = _check_keras_or_tf(predict)
         self.meta['params'].update(is_model=is_model, is_model_keras=is_model_keras)
         self.meta['params'].update(is_ae=is_ae, is_ae_keras=is_ae_keras)
         self.meta['params'].update(is_enc=is_enc, is_enc_keras=is_enc_keras)
@@ -492,7 +193,7 @@ class CounterFactualProto(Explainer, FitMixin):
             self.ae_model = False
 
         if use_kdtree and self.enc_model:
-            logger.warning('Both an encoder and k-d trees enabled. Using the encoder for the prototype loss term.')
+            # logger.warning('Both an encoder and k-d trees enabled. Using the encoder for the prototype loss term.')
 
         if use_kdtree or self.enc_model:
             self.enc_or_kdtree = True
@@ -1143,7 +844,7 @@ class CounterFactualProto(Explainer, FitMixin):
 
 
         elif self.use_kdtree:
-            logger.warning('No encoder specified. Using k-d trees to represent class prototypes.')
+            # logger.warning('No encoder specified. Using k-d trees to represent class prototypes.')
             if trustscore_kwargs is not None:
                 ts = TrustScore(**trustscore_kwargs)
             else:
@@ -1288,7 +989,7 @@ class CounterFactualProto(Explainer, FitMixin):
             dist_adv = self.kdtrees[adv_class].query(X, k=1)[0]
             dist_orig = self.kdtrees[orig_class].query(X, k=1)[0]
         else:
-            logger.warning('Need either an encoder or the k-d trees enabled to compute distance scores.')
+            # logger.warning('Need either an encoder or the k-d trees enabled to compute distance scores.')
         return dist_orig / (dist_adv + eps)
 
     def attack(self, X: np.ndarray, Y: np.ndarray, target_class: list = None, k: int = None, k_type: str = 'mean',
@@ -1661,8 +1362,8 @@ class CounterFactualProto(Explainer, FitMixin):
             params.pop(key)
 
         if X.shape[0] != 1:
-            logger.warning('Currently only single instance explanations supported (first dim = 1), '
-                           'but first dim = %s', X.shape[0])
+            # logger.warning('Currently only single instance explanations supported (first dim = 1), '
+                           # 'but first dim = %s', X.shape[0])
 
         # output explanation dictionary
         data = copy.deepcopy(DEFAULT_DATA_CFP)
@@ -1694,7 +1395,7 @@ class CounterFactualProto(Explainer, FitMixin):
 
         # add to explanation dict
         if not self.best_attack:
-            logger.warning('No counterfactual found!')
+            # logger.warning('No counterfactual found!')
 
             # create explanation object
             explanation = Explanation(meta=copy.deepcopy(self.meta), data=data)
@@ -1718,3 +1419,328 @@ class CounterFactualProto(Explainer, FitMixin):
         explanation = Explanation(meta=copy.deepcopy(self.meta), data=data)
 
         return explanation
+
+def main():
+    print('hdhdhdh')
+
+    class CustomDataGenerator(Sequence):
+        
+        def __init__(self, data_path, batch_size, data_index, shuffle, steps_per_epoch):
+            '''
+            data: dictionary of data, each key is a multivariate time serie
+            window_length: length of the window in which the time series are going to be divided
+            n_instances = number of instances
+            shuffle: boolean (True -> shuffle the data, False -> dont shuffle)
+            indexes: list of indexes
+            batch_size: batch size
+            '''
+            self.data_path = data_path
+            self.shuffle = shuffle
+            self.data_index = data_index
+            self.batch_size = batch_size
+            self.steps_per_epoch = steps_per_epoch
+        
+        def __len__(self):
+            """ Method called at the time of requiring the number of batches per epoch
+
+                Returns:
+                    int: number of batches per epoch
+
+            """
+            return self.steps_per_epoch
+        
+        def on_epoch_end(self):
+            """ Method called at the end of every epoch.
+                shuffle data to avoid the network from learning the order of the data
+            """
+            if self.shuffle == True:
+                np.random.shuffle(self.data_index)
+                
+        def __getitem__(self, idx):
+            'Generate one batch of data'
+            start_point = self.batch_size * idx
+            stop_point = start_point + self.batch_size
+            
+            # the last batch may have less instances
+            if (idx + 1) == self.steps_per_epoch:
+                stop_point = len(self.data_index)
+            
+            # h5py only supports ascending indexing
+            index_list = np.sort(self.data_index[start_point:stop_point])
+            h5f = h5py.File(self.data_path, 'r')
+            X = h5f['X_df'][index_list,:,:]
+            return X,X
+        
+
+    def attention_3d_block(hidden_states_encoder,hidden_states_decoder):
+        # hidden_states.shape = (batch_size, time_steps, hidden_size)
+        hidden_size = int(hidden_states_encoder.shape[2])
+        # Inside dense layer
+        #              hidden_states            dot               W            =>           score_first_part
+        # (batch_size, time_steps, hidden_size) dot (hidden_size, hidden_size) => (batch_size, time_steps, hidden_size)
+        # W is the trainable weight matrix of attention
+        # Luong's multiplicative style score
+        score_first_part = Dense(hidden_size, use_bias=False, name='attention_score_vec')(hidden_states_encoder)
+        #            score_first_part           dot        last_hidden_state     => attention_weights
+        # (batch_size, time_steps, hidden_size) dot   (batch_size, hidden_size)  => (batch_size, time_steps)
+
+
+        #SHAPES:
+            #HIDDEN_STATE_ENCODER = 14(time steps) x 128 (hidden_size)
+            #HIDDEN_STATE_DECODER = 14(time steps) x 128 (hidden_size)
+            
+        hidden_states_decoder = Permute((2, 1))(hidden_states_decoder) 
+        score = dot([score_first_part, hidden_states_decoder], [2,1], name='attention_score')
+        attention_weights = Activation('softmax', name='attention_weight')(score)
+        
+        # (batch_size, time_steps, hidden_size) dot (batch_size, time_steps) => (batch_size, hidden_size)
+        context_vector = dot([hidden_states_encoder, attention_weights], [1, 1], name='context_vector')
+        context_vector = Permute((2, 1))(context_vector)
+    #     pre_activation = concatenate([context_vector, hidden_states_decoder], name='attention_output')
+        attention_vector = Dense(15, use_bias=False, activation='tanh',
+                                 name='attention_vector')(context_vector)
+        return attention_vector
+
+    def seq2seqAttention(rnn_layer_type, n_rnn_units, return_sequences,x,input_dim,name):
+        encoder = get_recurrent_layer(rnn_layer_type, n_rnn_units, return_sequences, x)
+        last_hidden_state = Lambda(lambda x: x[:, -1, :], output_shape=(encoder.shape[0],), name='last_hidden_state')(
+            encoder)  
+        x = RepeatVector(encoder.shape[1])(last_hidden_state)
+        decoder = get_recurrent_layer(rnn_layer_type, n_rnn_units, return_sequences, x)
+        attention_mul = attention_3d_block(encoder,decoder)
+        return attention_mul,last_hidden_state
+
+
+    def generate_LSTM_Autoencoder_with_Attention(time_steps,n_units,learning_rate,window_length):
+
+        input_layer = Input((30,15))
+        input_dim = input_layer.shape[2]
+        x,z = seq2seqAttention('LSTM', n_units, True,input_layer,input_dim,'seq2seq')
+        lstm_autoencoder_model = Model(input_layer, x)
+        encoder_model = Model(input_layer, z)
+        lstm_autoencoder_model.summary()
+        adam = Adam(lr = learning_rate)
+        lstm_autoencoder_model.compile(optimizer=adam, loss='mse')
+
+        return encoder_model,lstm_autoencoder_model
+
+
+    def get_recurrent_layer(rnn_layer_type, n_rnn_units, return_sequences, input_tensor):
+        """ generate the specified recurrent layer type
+
+            Args:
+                rnn_layer_type (string): the type of the recurrent layer (LSTM, Bi-LSTM, GRU, Bi-GRU, SimpleRNN)
+                n_rnn_units (int): number of units on each recurrent layer
+                return_sequences (bool): whether to return the sequence or not
+                input_tensor (tensor): input tensor of the corresponding layer
+
+            Returns:
+                keras.layers: recurrent layer of required type
+
+        """
+        if rnn_layer_type == 'LSTM':
+            rnn_layer = LSTM(units=n_rnn_units, return_sequences=return_sequences)(input_tensor)
+        elif rnn_layer_type == 'Bi-LSTM':
+            rnn_layer = Bidirectional(LSTM(units=n_rnn_units, return_sequences=return_sequences))(input_tensor)
+        elif rnn_layer_type == 'GRU':
+            rnn_layer = GRU(units=n_rnn_units, return_sequences=return_sequences)(input_tensor)
+        elif rnn_layer_type == 'Bi-GRU':
+            rnn_layer = Bidirectional(GRU(units=n_rnn_units, return_sequences=return_sequences))(input_tensor)
+        elif rnn_layer_type == 'SimpleRNN':
+            rnn_layer = SimpleRNN(units=n_rnn_units, return_sequences=return_sequences)(input_tensor)
+        else:
+            warnings.warn('Job aborted! Please, set a valid recurrent layer type (LSTM, Bi-LSTM, GRU, Bi-GRU, SimpleRNN)')
+            raise SystemExit
+
+        return rnn_layer
+
+    n_sensors = 15
+    time_steps = 30
+    window_length = 30
+    batch_size = 64
+    rnn_layer_type = 'LSTM'
+    n_units = 32
+    n_epochs = 1500
+    learning_rate = 0.0001
+
+    encoder, ae = generate_LSTM_Autoencoder_with_Attention(time_steps,n_units,learning_rate,window_length)
+    ae = load_model('/data/jlabaien/PHD/Turbofan/Model/lstmAEwithATT_model.h5')
+    encoder.set_weights(ae.get_weights()[:3])
+
+    class GetProjectionsTrain():
+        
+        def __init__(self, n_groups, z_path = '/data/jlabaien/PHD/Turbofan/Model/LatentSpace_unsupervised_attAE.h5', plot_space = True):
+            
+            self.n_groups = n_groups
+            self.plot_space = plot_space
+            with h5py.File('/data/jlabaien/PHD/Turbofan/Model/LatentSpace_unsupervised_attAE.h5', 'r') as hf:
+                self.encoded_features = hf['x_df'][:]
+                self.data_y = hf['y_df'][:]
+                
+        def PCA(self,):
+            
+            feat_cols = [ 'sample'+str(i) for i in range(self.encoded_features.shape[1]) ]
+            df = pd.DataFrame(self.encoded_features,columns=feat_cols)
+
+            #PCA
+            pca = PCA(n_components=3)
+            pca_fitted = pca.fit(df[feat_cols].values)
+            pca_result = pca.fit_transform(df[feat_cols].values)
+
+            df['pca-one'] = pca_result[:,0]
+            df['pca-two'] = pca_result[:,1] 
+            df['pca-three'] = pca_result[:,2]
+            df['y'] = self.data_y
+            
+            return pca_fitted, pca_result,df
+        
+        def pc1_split_and_mean(self,pca_result):
+            min_pc1 = min(pca_result[:,0])
+            max_pc1 = max(pca_result[:,0])
+            split = (max_pc1-min_pc1)/self.n_groups
+            index_list = []
+            for i in range(self.n_groups + 1):
+                index_list.append(np.where((pca_result[:,0] > min_pc1+split*i -split/2) & (pca_result[:,0] <= min_pc1+split*(i+1)-split/2)))
+            return index_list
+        
+        def get_prototypes(self,group_indexes):
+            prototypes = np.zeros((len(group_indexes),self.encoded_features.shape[1]))
+            for i in range(len(group_indexes)):
+                prototypes[i] = np.mean(self.encoded_features[group_indexes[i][0]],axis=0)
+            return prototypes
+        
+        def get_regression_line(self,prototypes_pca):
+            m,b = np.polyfit(prototypes_pca[:,0], prototypes_pca[:,1], 1)
+            line = LineString([(0,0*m+b), (1, 1*m+b)])
+            return m,b,line
+        
+        def orthogonal_projection(self,pt):
+            point = Point(pt[0], pt[1])
+            x = np.array(point.coords[0])
+            n = self.v - self.u
+            n /= np.linalg.norm(n, 2)
+            P = self.u + n*np.dot(x - self.u, n)
+
+            return P
+        
+        def visualize(self,df,prototypes_pca,projection_pc,projection_prototypes,m,b):
+            fig = plt.figure(figsize=(16,7))
+            ax1 = plt.subplot(1, 1, 1)
+            sns.scatterplot(
+                x="pca-one", y="pca-two",
+                hue="y",
+                palette=sns.color_palette("hls", 4),
+                data=df,
+                legend="full",
+                alpha=0.3,
+                ax=ax1
+            )
+            plt.scatter(prototypes_pca[:,0],prototypes_pca[:,1],marker = 'D',color = 'black')
+            plt.plot(np.linspace(-1,1.2,100), m*np.linspace(-1,1.2,100)+ b,color = 'orange', linewidth=3.0)
+
+            plt.scatter(projection_pc[:,0],projection_pc[:,1],marker = '+',color = 'blue',s =100)
+            plt.scatter(projection_prototypes[:,0],projection_prototypes[:,1],marker = '+',color = 'red',s =200)
+            return fig
+        
+        def main(self,):
+            pca_fitted, pca_result,df = self.PCA()
+            group_indexes = self.pc1_split_and_mean(pca_result)
+            prototypes = self.get_prototypes(group_indexes)
+            prototypes_pca = pca_fitted.fit_transform(prototypes)
+            m,b,line = self.get_regression_line(prototypes_pca)
+            self.u = np.array(line.coords[0])
+            self.v = np.array(line.coords[len(line.coords)-1])
+            projection_pc = np.apply_along_axis(self.orthogonal_projection, 1, pca_result[:,0:2])
+            projection_prototypes = np.apply_along_axis(self.orthogonal_projection, 1, prototypes_pca[:,0:2])
+            
+            if self.plot_space:
+                fig = self.visualize(df,prototypes_pca,projection_pc,projection_prototypes,m,b)
+
+            return pca_fitted, projection_pc, projection_prototypes, line, pca_result, prototypes_pca,fig,prototypes
+
+    class TubofanUnsupervisedClassifier():
+        '''
+        This classifier takes as input MVTS from Turbofan dataset and returns a value corresponding the state
+        in which this time series is in that moment.
+        '''
+        def __init__(self, pca_fitted, projection_pc, projection_proto, line, encoder,test_points):
+            '''
+            pca: principal components of encoded training features
+            projection_pc: projection of encoded
+            '''
+            self.encoder = encoder
+            self.pca_fitted = pca_fitted
+            self.projection_pc = projection_pc
+            self.projection_proto = projection_proto
+            self.line = line
+            self.test_points = test_points
+            
+            
+        def softmax(self,x, axis = 0):
+            e_x = np.exp(x - np.max(x, axis = axis, keepdims = True))
+            return e_x / e_x.sum(axis, keepdims = True)
+        
+        def compute_distance_value(self,prototypes,point):
+            n_prototypes = len(prototypes)
+            distance_values = np.zeros(len(prototypes))
+            for i in range(len(prototypes)):
+                dist = np.abs(prototypes[i]-point)
+                distance_values[i] = 1/dist[0]
+            return self.softmax(distance_values)
+        
+        def classifier(self,projected_points):
+            probs = np.zeros((projected_points.shape[0],self.projection_proto.shape[0]))
+            predicted_labels = np.zeros(projected_points.shape[0])
+            for i in range(projected_points.shape[0]):
+                probs[i,:] = self.compute_distance_value(self.projection_proto,projected_points[i])
+                predicted_labels[i] = np.argmax(probs[i,:])
+            return probs, predicted_labels
+        
+        def orthogonal_projection(self,pt):
+            point = Point(pt[0], pt[1])
+            x = np.array(point.coords[0])
+            n = self.v - self.u
+            n /= np.linalg.norm(n, 2)
+            P = self.u + n*np.dot(x - self.u, n)
+
+            return P
+        
+        def main(self,):
+            z = self.encoder.predict(self.test_points)
+            z_pca = self.pca_fitted.fit_transform(z)
+            self.u = np.array(line.coords[0])
+            self.v = np.array(line.coords[len(line.coords)-1])
+            projection_z_pca = np.apply_along_axis(self.orthogonal_projection, 1, z_pca[:,0:2])
+            probs, preds = self.classifier(projection_z_pca)
+            return probs, preds, projection_z_pca,z_pca,z
+
+
+    data_path = '/data/jlabaien/PHD/Turbofan/AllData_FD001_4_splits.h5'
+
+    with h5py.File(data_path, 'r') as hf:
+        x_train = hf['X_df'][:]
+
+
+    def predictor(pca_fitted, projection_pc, projection_prototypes, line, encoder,test_points):
+        test = TubofanUnsupervisedClassifier(pca_fitted, projection_pc, projection_prototypes, line, encoder,test_points)
+        probs, preds, projection_z_pca,z_pca = test.main()
+        return probs, preds, projection_z_pca,z_pca,z
+
+    shape = (1,) + x_train.shape[1:]
+    gamma = 100.
+    theta = 100.
+    c_init = 1.
+    c_steps = 2
+    max_iterations = 1000
+    feature_range = (x_train.min(),x_train.max())
+
+    # initialize explainer, fit and generate counterfactual
+    cf = CounterFactualProto(predictor, shape, gamma=gamma, theta=theta,
+                             ae_model=ae, enc_model=encoder, max_iterations=max_iterations,
+                             feature_range=feature_range, c_init=c_init, c_steps=c_steps)
+    start_time = time()
+    cf.fit(x_train)  # find class prototypes
+    print('Time to find prototypes each class: {:.3f} sec'.format(time() - start_time))
+    start_time = time()
+
+main()
