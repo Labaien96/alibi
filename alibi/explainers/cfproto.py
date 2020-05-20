@@ -6,6 +6,15 @@ import numpy as np
 import sys
 import tensorflow as tf
 from typing import Callable, Dict, List, Tuple, Union, TYPE_CHECKING, Sequence
+from sklearn.manifold import TSNE
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+import seaborn as sns
+import pandas as pd
+from sklearn.decomposition import PCA
+import numpy as np
+from shapely.geometry import Point
+from shapely.geometry import LineString
 
 from alibi.api.interfaces import Explainer, Explanation, FitMixin
 from alibi.api.defaults import DEFAULT_META_CFP, DEFAULT_DATA_CFP
@@ -16,16 +25,346 @@ from alibi.utils.gradients import perturb
 from alibi.utils.mapping import ohe_to_ord_shape, ord_to_num, num_to_ord, ohe_to_ord, ord_to_ohe
 from alibi.utils.tf import _check_keras_or_tf, argmax_grad, argmin_grad, one_hot_grad, round_grad
 
+import os
+import math
+import random
+from sklearn.model_selection import train_test_split
+
+os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+os.environ["CUDA_VISIBLE_DEVICES"] = '0'
+
+import tensorflow as tf
+import h5py
+import numpy as np
+from tensorflow.python.keras import backend as K
+from matplotlib import pyplot as plt
+from tensorflow import keras
+from tensorflow.keras.layers import Conv1D, Input, concatenate, Dense, Flatten, Dropout, BatchNormalization, Activation, \
+    MaxPooling1D, SimpleRNN, LSTM, GRU, Bidirectional, Reshape, Permute, RepeatVector, multiply, Lambda, dot,\
+    LocallyConnected1D, Masking
+from tensorflow.keras.layers import TimeDistributed
+from tensorflow.keras.models import Model, load_model
+from tensorflow.keras.optimizers import Adam, RMSprop
+from tensorflow.keras.utils import multi_gpu_model
+from tensorflow.keras.callbacks import Callback, EarlyStopping, ModelCheckpoint
+from tensorflow.keras.utils import Sequence
+from tensorflow.keras.utils import plot_model
+from sklearn.preprocessing import normalize
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+
+
+class CustomDataGenerator(Sequence):
+    
+    def __init__(self, data_path, batch_size, data_index, shuffle, steps_per_epoch):
+        '''
+        data: dictionary of data, each key is a multivariate time serie
+        window_length: length of the window in which the time series are going to be divided
+        n_instances = number of instances
+        shuffle: boolean (True -> shuffle the data, False -> dont shuffle)
+        indexes: list of indexes
+        batch_size: batch size
+        '''
+        self.data_path = data_path
+        self.shuffle = shuffle
+        self.data_index = data_index
+        self.batch_size = batch_size
+        self.steps_per_epoch = steps_per_epoch
+    
+    def __len__(self):
+        """ Method called at the time of requiring the number of batches per epoch
+
+            Returns:
+                int: number of batches per epoch
+
+        """
+        return self.steps_per_epoch
+    
+    def on_epoch_end(self):
+        """ Method called at the end of every epoch.
+            shuffle data to avoid the network from learning the order of the data
+        """
+        if self.shuffle == True:
+            np.random.shuffle(self.data_index)
+            
+    def __getitem__(self, idx):
+        'Generate one batch of data'
+        start_point = self.batch_size * idx
+        stop_point = start_point + self.batch_size
+        
+        # the last batch may have less instances
+        if (idx + 1) == self.steps_per_epoch:
+            stop_point = len(self.data_index)
+        
+        # h5py only supports ascending indexing
+        index_list = np.sort(self.data_index[start_point:stop_point])
+        h5f = h5py.File(self.data_path, 'r')
+        X = h5f['X_df'][index_list,:,:]
+        return X,X
+    
+
+def attention_3d_block(hidden_states_encoder,hidden_states_decoder):
+    # hidden_states.shape = (batch_size, time_steps, hidden_size)
+    hidden_size = int(hidden_states_encoder.shape[2])
+    # Inside dense layer
+    #              hidden_states            dot               W            =>           score_first_part
+    # (batch_size, time_steps, hidden_size) dot (hidden_size, hidden_size) => (batch_size, time_steps, hidden_size)
+    # W is the trainable weight matrix of attention
+    # Luong's multiplicative style score
+    score_first_part = Dense(hidden_size, use_bias=False, name='attention_score_vec')(hidden_states_encoder)
+    #            score_first_part           dot        last_hidden_state     => attention_weights
+    # (batch_size, time_steps, hidden_size) dot   (batch_size, hidden_size)  => (batch_size, time_steps)
+
+
+    #SHAPES:
+        #HIDDEN_STATE_ENCODER = 14(time steps) x 128 (hidden_size)
+        #HIDDEN_STATE_DECODER = 14(time steps) x 128 (hidden_size)
+        
+    hidden_states_decoder = Permute((2, 1))(hidden_states_decoder) 
+    score = dot([score_first_part, hidden_states_decoder], [2,1], name='attention_score')
+    attention_weights = Activation('softmax', name='attention_weight')(score)
+    
+    # (batch_size, time_steps, hidden_size) dot (batch_size, time_steps) => (batch_size, hidden_size)
+    context_vector = dot([hidden_states_encoder, attention_weights], [1, 1], name='context_vector')
+    context_vector = Permute((2, 1))(context_vector)
+#     pre_activation = concatenate([context_vector, hidden_states_decoder], name='attention_output')
+    attention_vector = Dense(15, use_bias=False, activation='tanh',
+                             name='attention_vector')(context_vector)
+    return attention_vector
+
+def seq2seqAttention(rnn_layer_type, n_rnn_units, return_sequences,x,input_dim,name):
+    encoder = get_recurrent_layer(rnn_layer_type, n_rnn_units, return_sequences, x)
+    last_hidden_state = Lambda(lambda x: x[:, -1, :], output_shape=(encoder.shape[0],), name='last_hidden_state')(
+        encoder)  
+    x = RepeatVector(encoder.shape[1])(last_hidden_state)
+    decoder = get_recurrent_layer(rnn_layer_type, n_rnn_units, return_sequences, x)
+    attention_mul = attention_3d_block(encoder,decoder)
+    return attention_mul,last_hidden_state
+
+
+def generate_LSTM_Autoencoder_with_Attention(time_steps,n_units,learning_rate,window_length):
+
+    input_layer = Input((30,15))
+    input_dim = input_layer.shape[2]
+    x,z = seq2seqAttention('LSTM', n_units, True,input_layer,input_dim,'seq2seq')
+    lstm_autoencoder_model = Model(input_layer, x)
+    encoder_model = Model(input_layer, z)
+    lstm_autoencoder_model.summary()
+    adam = Adam(lr = learning_rate)
+    lstm_autoencoder_model.compile(optimizer=adam, loss='mse')
+
+    return encoder_model,lstm_autoencoder_model
+
+
+def get_recurrent_layer(rnn_layer_type, n_rnn_units, return_sequences, input_tensor):
+    """ generate the specified recurrent layer type
+
+        Args:
+            rnn_layer_type (string): the type of the recurrent layer (LSTM, Bi-LSTM, GRU, Bi-GRU, SimpleRNN)
+            n_rnn_units (int): number of units on each recurrent layer
+            return_sequences (bool): whether to return the sequence or not
+            input_tensor (tensor): input tensor of the corresponding layer
+
+        Returns:
+            keras.layers: recurrent layer of required type
+
+    """
+    if rnn_layer_type == 'LSTM':
+        rnn_layer = LSTM(units=n_rnn_units, return_sequences=return_sequences)(input_tensor)
+    elif rnn_layer_type == 'Bi-LSTM':
+        rnn_layer = Bidirectional(LSTM(units=n_rnn_units, return_sequences=return_sequences))(input_tensor)
+    elif rnn_layer_type == 'GRU':
+        rnn_layer = GRU(units=n_rnn_units, return_sequences=return_sequences)(input_tensor)
+    elif rnn_layer_type == 'Bi-GRU':
+        rnn_layer = Bidirectional(GRU(units=n_rnn_units, return_sequences=return_sequences))(input_tensor)
+    elif rnn_layer_type == 'SimpleRNN':
+        rnn_layer = SimpleRNN(units=n_rnn_units, return_sequences=return_sequences)(input_tensor)
+    else:
+        warnings.warn('Job aborted! Please, set a valid recurrent layer type (LSTM, Bi-LSTM, GRU, Bi-GRU, SimpleRNN)')
+        raise SystemExit
+
+    return rnn_layer
+
+n_sensors,time_steps,window_length,batch_size,rnn_layer_type,n_units = 15,30,30,64,'LSTM',32
+
 if TYPE_CHECKING:  # pragma: no cover
     import keras
 
 logger = logging.getLogger(__name__)
 
+encoder, ae = generate_LSTM_Autoencoder_with_Attention(time_steps,n_units,learning_rate,window_length)
+ae = load_model('/data/jlabaien/PHD/Turbofan/Model/lstmAEwithATT_model.h5')
+encoder.set_weights(ae.get_weights()[:3])
+
+class GetProjectionsTrain():
+    
+    def __init__(self, n_groups, z_path = '/data/jlabaien/PHD/Turbofan/Model/LatentSpace_unsupervised_attAE.h5', plot_space = True):
+        
+        self.n_groups = n_groups
+        self.plot_space = plot_space
+        with h5py.File('/data/jlabaien/PHD/Turbofan/Model/LatentSpace_unsupervised_attAE.h5', 'r') as hf:
+            self.encoded_features = hf['x_df'][:]
+            self.data_y = hf['y_df'][:]
+            
+    def PCA(self,):
+        
+        feat_cols = [ 'sample'+str(i) for i in range(self.encoded_features.shape[1]) ]
+        df = pd.DataFrame(self.encoded_features,columns=feat_cols)
+
+        #PCA
+        pca = PCA(n_components=3)
+        pca_fitted = pca.fit(df[feat_cols].values)
+        pca_result = pca.fit_transform(df[feat_cols].values)
+
+        df['pca-one'] = pca_result[:,0]
+        df['pca-two'] = pca_result[:,1] 
+        df['pca-three'] = pca_result[:,2]
+        df['y'] = self.data_y
+        
+        return pca_fitted, pca_result,df
+    
+    def pc1_split_and_mean(self,pca_result):
+        min_pc1 = min(pca_result[:,0])
+        max_pc1 = max(pca_result[:,0])
+        split = (max_pc1-min_pc1)/self.n_groups
+        index_list = []
+        for i in range(self.n_groups + 1):
+            index_list.append(np.where((pca_result[:,0] > min_pc1+split*i -split/2) & (pca_result[:,0] <= min_pc1+split*(i+1)-split/2)))
+        return index_list
+    
+    def get_prototypes(self,group_indexes):
+        prototypes = np.zeros((len(group_indexes),self.encoded_features.shape[1]))
+        for i in range(len(group_indexes)):
+            prototypes[i] = np.mean(self.encoded_features[group_indexes[i][0]],axis=0)
+        return prototypes
+    
+    def get_regression_line(self,prototypes_pca):
+        m,b = np.polyfit(prototypes_pca[:,0], prototypes_pca[:,1], 1)
+        line = LineString([(0,0*m+b), (1, 1*m+b)])
+        return m,b,line
+    
+    def orthogonal_projection(self,pt):
+        point = Point(pt[0], pt[1])
+        x = np.array(point.coords[0])
+        n = self.v - self.u
+        n /= np.linalg.norm(n, 2)
+        P = self.u + n*np.dot(x - self.u, n)
+
+        return P
+    
+    def visualize(self,df,prototypes_pca,projection_pc,projection_prototypes,m,b):
+        fig = plt.figure(figsize=(16,7))
+        ax1 = plt.subplot(1, 1, 1)
+        sns.scatterplot(
+            x="pca-one", y="pca-two",
+            hue="y",
+            palette=sns.color_palette("hls", 4),
+            data=df,
+            legend="full",
+            alpha=0.3,
+            ax=ax1
+        )
+        plt.scatter(prototypes_pca[:,0],prototypes_pca[:,1],marker = 'D',color = 'black')
+        plt.plot(np.linspace(-1,1.2,100), m*np.linspace(-1,1.2,100)+ b,color = 'orange', linewidth=3.0)
+
+        plt.scatter(projection_pc[:,0],projection_pc[:,1],marker = '+',color = 'blue',s =100)
+        plt.scatter(projection_prototypes[:,0],projection_prototypes[:,1],marker = '+',color = 'red',s =200)
+        return fig
+    
+    def main(self,):
+        pca_fitted, pca_result,df = self.PCA()
+        group_indexes = self.pc1_split_and_mean(pca_result)
+        prototypes = self.get_prototypes(group_indexes)
+        prototypes_pca = pca_fitted.fit_transform(prototypes)
+        m,b,line = self.get_regression_line(prototypes_pca)
+        self.u = np.array(line.coords[0])
+        self.v = np.array(line.coords[len(line.coords)-1])
+        projection_pc = np.apply_along_axis(self.orthogonal_projection, 1, pca_result[:,0:2])
+        projection_prototypes = np.apply_along_axis(self.orthogonal_projection, 1, prototypes_pca[:,0:2])
+        
+        if self.plot_space:
+            fig = self.visualize(df,prototypes_pca,projection_pc,projection_prototypes,m,b)
+
+        return pca_fitted, projection_pc, projection_prototypes, line, pca_result, prototypes_pca,fig,prototypes
+
+trainer = GetProjectionsTrain(n_groups = 10)
+
+pca_fitted, projection_pc, projection_prototypes, line, pca_result, prototypes_pca,fig = trainer.main()
+
+class TubofanUnsupervisedClassifier():
+    '''
+    This classifier takes as input MVTS from Turbofan dataset and returns a value corresponding the state
+    in which this time series is in that moment.
+    '''
+    def __init__(self, pca_fitted, projection_pc, projection_proto, line, encoder,test_points):
+        '''
+        pca: principal components of encoded training features
+        projection_pc: projection of encoded
+        '''
+        self.encoder = encoder
+        self.pca_fitted = pca_fitted
+        self.projection_pc = projection_pc
+        self.projection_proto = projection_proto
+        self.line = line
+        self.test_points = test_points
+        
+        
+    def softmax(self,x, axis = 0):
+        e_x = np.exp(x - np.max(x, axis = axis, keepdims = True))
+        return e_x / e_x.sum(axis, keepdims = True)
+    
+    def compute_distance_value(self,prototypes,point):
+        n_prototypes = len(prototypes)
+        distance_values = np.zeros(len(prototypes))
+        for i in range(len(prototypes)):
+            dist = np.abs(prototypes[i]-point)
+            distance_values[i] = 1/dist[0]
+        return self.softmax(distance_values)
+    
+    def classifier(self,projected_points):
+        probs = np.zeros((projected_points.shape[0],self.projection_proto.shape[0]))
+        predicted_labels = np.zeros(projected_points.shape[0])
+        for i in range(projected_points.shape[0]):
+            probs[i,:] = self.compute_distance_value(self.projection_proto,projected_points[i])
+            predicted_labels[i] = np.argmax(probs[i,:])
+        return probs, predicted_labels
+    
+    def orthogonal_projection(self,pt):
+        point = Point(pt[0], pt[1])
+        x = np.array(point.coords[0])
+        n = self.v - self.u
+        n /= np.linalg.norm(n, 2)
+        P = self.u + n*np.dot(x - self.u, n)
+
+        return P
+    
+    def main(self,):
+        z = self.encoder.predict(self.test_points)
+        z_pca = self.pca_fitted.fit_transform(z)
+        self.u = np.array(line.coords[0])
+        self.v = np.array(line.coords[len(line.coords)-1])
+        projection_z_pca = np.apply_along_axis(self.orthogonal_projection, 1, z_pca[:,0:2])
+        probs, preds = self.classifier(projection_z_pca)
+        return probs, preds, projection_z_pca,z_pca,z
+
+data_path = '/data/jlabaien/PHD/Turbofan/AllData_FD001_4_splits.h5'
+
+with h5py.File(data_path, 'r') as hf:
+    test_points = hf['X_df'][:]
+
+test = TubofanUnsupervisedClassifier(pca_fitted, projection_pc, projection_prototypes, line, encoder,test_points)
+
+probs, preds, projection_z_pca,z_pca,z = test.main()
+
+def predictor(pca_fitted, projection_pc, projection_prototypes, line, encoder,test_points):
+    test = TubofanUnsupervisedClassifier(pca_fitted, projection_pc, projection_prototypes, line, encoder,test_points)
+    probs, preds, projection_z_pca,z_pca = test.main()
+    return probs, preds, projection_z_pca,z_pca,z
+
 
 class CounterFactualProto(Explainer, FitMixin):
 
     def __init__(self,
-                 predict: Union[Callable, tf.keras.Model, 'keras.Model'],
+                 predict: predictor #Union[Callable, tf.keras.Model, 'keras.Model'],
                  shape: tuple,
                  kappa: float = 0.,
                  beta: float = .1,
@@ -101,12 +440,20 @@ class CounterFactualProto(Explainer, FitMixin):
         sess
             Optional Tensorflow session that will be used if passed instead of creating or inferring one internally
         """
+
+
+        trainer = GetProjectionsTrain(n_groups = 10)
+
+        self.pca_fitted, self.projection_pc, self.projection_prototypes, self.line, self.pca_result, self.prototypes_pca,self.fig, self.prototypes = trainer.main()
+
+
         super().__init__(meta=copy.deepcopy(DEFAULT_META_CFP))
         params = locals()
         remove = ['self', 'predict', 'ae_model', 'enc_model', 'sess', '__class__']
         for key in remove:
             params.pop(key)
         self.meta['params'].update(params)
+
 
         self.predict = predict
 
@@ -128,10 +475,11 @@ class CounterFactualProto(Explainer, FitMixin):
 
         if is_model:  # Keras or TF model
             self.model = True
-            self.classes = self.predict.predict(np.zeros(shape)).shape[1]  # type: ignore
+            # self.classes = self.predict.predict(np.zeros(shape)).shape[1]  # type: ignore
+            self.classes = 11
         else:  # black-box model
             self.model = False
-            self.classes = self.predict(np.zeros(shape)).shape[1]
+            self.classes = 11
 
         if is_enc:
             self.enc_model = True
@@ -567,15 +915,19 @@ class CounterFactualProto(Explainer, FitMixin):
                 self.loss_attack = tf.placeholder(tf.float32)
             elif self.c_init == 0. and self.c_steps == 1:  # prediction loss term not used
                 # make predictions on perturbed instance
-                self.pred_proba = self.predict(self.adv_cat)
-                self.pred_proba_s = self.predict(self.adv_cat_s)
+                self.pred_proba, _, _, _, _ = self.predict(self.pca_fitted, self.projection_pc, self.projection_prototypes, self.line, self.encoder,self.ad_cat)
+                self.pred_proba_s, _, _, _, _ = self.predict(self.pca_fitted, self.projection_pc, self.projection_prototypes, self.line, self.encoder,self.ad_cat_s)
+                # self.pred_proba = self.predict(self.adv_cat)
+                # self.pred_proba_s = self.predict(self.adv_cat_s)
 
                 self.loss_attack = tf.constant(0.)
                 self.loss_attack_s = tf.constant(0.)
             else:
                 # make predictions on perturbed instance
-                self.pred_proba = self.predict(self.adv_cat)
-                self.pred_proba_s = self.predict(self.adv_cat_s)
+                self.pred_proba, _, _, _, _ = self.predict(self.pca_fitted, self.projection_pc, self.projection_prototypes, self.line, self.encoder,self.ad_cat)
+                self.pred_proba_s, _, _, _, _ = self.predict(self.pca_fitted, self.projection_pc, self.projection_prototypes, self.line, self.encoder,self.ad_cat_s)                
+                # self.pred_proba = self.predict(self.adv_cat)
+                # self.pred_proba_s = self.predict(self.adv_cat_s)
 
                 # probability of target label prediction
                 self.target_proba = tf.reduce_sum(self.target * self.pred_proba, 1)
@@ -650,6 +1002,8 @@ class CounterFactualProto(Explainer, FitMixin):
         else:
             self.writer = None
 
+
+
     def fit(self, train_data: np.ndarray, trustscore_kwargs: dict = None, d_type: str = 'abdm',
             w: float = None, disc_perc: Sequence[Union[int, float]] = (25, 50, 75), standardize_cat_vars: bool = False,
             smooth: float = 1., center: bool = True, update_feature_range: bool = True) -> "CounterFactualProto":
@@ -692,10 +1046,11 @@ class CounterFactualProto(Explainer, FitMixin):
         # update metadata
         self.meta['params'].update(params)
 
-        if self.model:
-            preds = np.argmax(self.predict.predict(train_data), axis=1)  # type: ignore
-        else:
-            preds = np.argmax(self.predict(train_data), axis=1)
+        # if self.model:
+        #     preds = np.argmax(self.predict.predict(train_data), axis=1)  # type: ignore
+        # else:
+        #     preds 
+        #     preds = np.argmax(self.predict(train_data), axis=1)
 
         self.cat_vars_ord = None
         if self.is_cat:  # compute distance metrics for categorical variables
@@ -775,13 +1130,18 @@ class CounterFactualProto(Explainer, FitMixin):
             self.d_abs_ragged = np.array(self.d_abs_ragged)
 
         if self.enc_model:
-            enc_data = self.enc.predict(train_data)
+
+            probs, preds, projection_z_pca, z_pca, enc_data = self.predict(self.pca_fitted, self.projection_pc, self.projection_prototypes, self.line, self.encoder,train_data)
+            preds = np.argmax(preds,axis=1)
+
             self.class_proto = {}  # type: dict
             self.class_enc = {}  # type: dict
             for i in range(self.classes):
                 idx = np.where(preds == i)[0]
-                self.class_proto[i] = np.expand_dims(np.mean(enc_data[idx], axis=0), axis=0)
+                self.class_proto[i] = self.prototypes[i]#np.expand_dims(np.mean(enc_data[idx], axis=0), axis=0)
                 self.class_enc[i] = enc_data[idx]
+
+
         elif self.use_kdtree:
             logger.warning('No encoder specified. Using k-d trees to represent class prototypes.')
             if trustscore_kwargs is not None:
@@ -853,7 +1213,8 @@ class CounterFactualProto(Explainer, FitMixin):
 
         # N = gradient batch size; F = nb of features; P = nb of prediction classes; B = instance batch size
         # dL/dP -> BxP
-        preds = self.predict(X_pred)  # NxP
+        preds, _, _, _, _ = self.predict(self.pca_fitted, self.projection_pc, self.projection_prototypes, self.line, self.encoder,X_pred)
+        # preds = self.predict(X_pred)  # NxP
         preds_pert_pos, preds_pert_neg = perturb(preds, self.eps[0], proba=True)  # (N*P)xP
 
         def f(preds_pert):
@@ -879,7 +1240,8 @@ class CounterFactualProto(Explainer, FitMixin):
             X_pert = num_to_ord(X_pert, self.d_abs)
         if self.ohe:
             X_pert = ord_to_ohe(X_pert, cat_vars_ord)[0]
-        preds_concat = self.predict(X_pert)
+        # preds_concat = self.predict(X_pert)
+        preds_concat, _, _, _, _ = self.predict(self.pca_fitted, self.projection_pc, self.projection_prototypes, self.line, self.encoder,X_pert)
         n_pert = X_pert_pos.shape[0]
         dp_dx = preds_concat[:n_pert] - preds_concat[n_pert:]  # (N*F)*P
         dp_dx = np.reshape(np.reshape(dp_dx, (X.shape[0], -1)),
@@ -1138,7 +1500,8 @@ class CounterFactualProto(Explainer, FitMixin):
                         X_der = num_to_ord(X_der, self.d_abs)
                     if self.ohe:
                         X_der = ord_to_ohe(X_der, self.cat_vars_ord)[0]
-                    pred_proba = self.predict(X_der)
+                    pred_proba, _, _, _, _ = self.predict(self.pca_fitted, self.projection_pc, self.projection_prototypes, self.line, self.encoder,X_der)
+                    # pred_proba = self.predict(X_der)
 
                     # compute attack, total and L1+L2 losses as well as new perturbed instance
                     loss_attack = self.loss_fn(pred_proba, Y)
@@ -1306,9 +1669,11 @@ class CounterFactualProto(Explainer, FitMixin):
 
         if Y is None:
             if self.model:
-                Y_proba = self.predict.predict(X)  # type: ignore
+                # Y_proba = self.predict.predict(X)  # type: ignore
+                Y_proba, _, _, _, _ = self.predict(self.pca_fitted, self.projection_pc, self.projection_prototypes, self.line, self.encoder,X)
             else:
-                Y_proba = self.predict(X)
+                # Y_proba = self.predict(X)
+                Y_proba, _, _, _, _ = self.predict(self.pca_fitted, self.projection_pc, self.projection_prototypes, self.line, self.encoder,X)
             Y_ohe = np.zeros(Y_proba.shape)
             Y_class = np.argmax(Y_proba, axis=1)
             Y_ohe[np.arange(Y_proba.shape[0]), Y_class] = 1
@@ -1339,9 +1704,12 @@ class CounterFactualProto(Explainer, FitMixin):
         data['cf'] = {}
         data['cf']['X'] = best_attack
         if self.model:
-            Y_pert = self.predict.predict(best_attack)  # type: ignore
+            # Y_pert = self.predict.predict(best_attack)  # type: ignore
+            Y_pert, _, _, _, _ = self.predict(self.pca_fitted, self.projection_pc, self.projection_prototypes, self.line, self.encoder,best_attack)
+
         else:
-            Y_pert = self.predict(best_attack)
+            # Y_pert = self.predict(best_attack)
+            Y_pert, _, _, _, _ = self.predict(self.pca_fitted, self.projection_pc, self.projection_prototypes, self.line, self.encoder,best_attack)
         data['cf']['class'] = np.argmax(Y_pert, axis=1)[0]
         data['cf']['proba'] = Y_pert
         data['cf']['grads_graph'], data['cf']['grads_num'] = grads[0], grads[1]
