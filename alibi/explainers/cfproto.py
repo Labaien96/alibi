@@ -53,7 +53,7 @@ from tensorflow.keras.utils import plot_model
 from sklearn.preprocessing import normalize
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 
-
+# tf.disable_v2_behavior()
 
 if TYPE_CHECKING:  # pragma: no cover
     import keras
@@ -61,10 +61,164 @@ if TYPE_CHECKING:  # pragma: no cover
 # logger = logging.getLogger(__name__)
 
 
+class GetProjectionsTrain():
+    
+    def __init__(self, n_groups, z_path = '/data/jlabaien/PHD/Turbofan/Model/LatentSpace_unsupervised_attAE.h5', plot_space = True):
+        
+        self.n_groups = n_groups
+        self.plot_space = plot_space
+        with h5py.File('/data/jlabaien/PHD/Turbofan/Model/LatentSpace_unsupervised_attAE.h5', 'r') as hf:
+            self.encoded_features = hf['x_df'][:]
+            self.data_y = hf['y_df'][:]
+            
+    def PCA(self,):
+        
+        feat_cols = [ 'sample'+str(i) for i in range(self.encoded_features.shape[1]) ]
+        df = pd.DataFrame(self.encoded_features,columns=feat_cols)
+
+        #PCA
+        pca = PCA(n_components=3)
+        pca_fitted = pca.fit(df[feat_cols].values)
+        pca_result = pca.fit_transform(df[feat_cols].values)
+
+        df['pca-one'] = pca_result[:,0]
+        df['pca-two'] = pca_result[:,1] 
+        df['pca-three'] = pca_result[:,2]
+        df['y'] = self.data_y
+        
+        return pca_fitted, pca_result,df
+    
+    def pc1_split_and_mean(self,pca_result):
+        min_pc1 = min(pca_result[:,0])
+        max_pc1 = max(pca_result[:,0])
+        split = (max_pc1-min_pc1)/self.n_groups
+        index_list = []
+        for i in range(self.n_groups + 1):
+            index_list.append(np.where((pca_result[:,0] > min_pc1+split*i -split/2) & (pca_result[:,0] <= min_pc1+split*(i+1)-split/2)))
+        return index_list
+    
+    def get_prototypes(self,group_indexes):
+        prototypes = np.zeros((len(group_indexes),self.encoded_features.shape[1]))
+        for i in range(len(group_indexes)):
+            prototypes[i] = np.mean(self.encoded_features[group_indexes[i][0]],axis=0)
+        return prototypes
+    
+    def get_regression_line(self,prototypes_pca):
+        m,b = np.polyfit(prototypes_pca[:,0], prototypes_pca[:,1], 1)
+        line = LineString([(0,0*m+b), (1, 1*m+b)])
+        return m,b,line
+    
+    def orthogonal_projection(self,pt):
+        point = Point(pt[0], pt[1])
+        x = np.array(point.coords[0])
+        n = self.v - self.u
+        n /= np.linalg.norm(n, 2)
+        P = self.u + n*np.dot(x - self.u, n)
+
+        return P
+    
+    def visualize(self,df,prototypes_pca,projection_pc,projection_prototypes,m,b):
+        fig = plt.figure(figsize=(16,7))
+        ax1 = plt.subplot(1, 1, 1)
+        sns.scatterplot(
+            x="pca-one", y="pca-two",
+            hue="y",
+            palette=sns.color_palette("hls", 4),
+            data=df,
+            legend="full",
+            alpha=0.3,
+            ax=ax1
+        )
+        plt.scatter(prototypes_pca[:,0],prototypes_pca[:,1],marker = 'D',color = 'black')
+        plt.plot(np.linspace(-1,1.2,100), m*np.linspace(-1,1.2,100)+ b,color = 'orange', linewidth=3.0)
+
+        plt.scatter(projection_pc[:,0],projection_pc[:,1],marker = '+',color = 'blue',s =100)
+        plt.scatter(projection_prototypes[:,0],projection_prototypes[:,1],marker = '+',color = 'red',s =200)
+        return fig
+    
+    def main(self,):
+        pca_fitted, pca_result,df = self.PCA()
+        group_indexes = self.pc1_split_and_mean(pca_result)
+        prototypes = self.get_prototypes(group_indexes)
+        prototypes_pca = pca_fitted.fit_transform(prototypes)
+        m,b,line = self.get_regression_line(prototypes_pca)
+        self.u = np.array(line.coords[0])
+        self.v = np.array(line.coords[len(line.coords)-1])
+        projection_pc = np.apply_along_axis(self.orthogonal_projection, 1, pca_result[:,0:2])
+        projection_prototypes = np.apply_along_axis(self.orthogonal_projection, 1, prototypes_pca[:,0:2])
+        
+        if self.plot_space:
+            fig = self.visualize(df,prototypes_pca,projection_pc,projection_prototypes,m,b)
+
+        return pca_fitted, projection_pc, projection_prototypes, line, pca_result, prototypes_pca,fig,prototypes
+
+    class TubofanUnsupervisedClassifier():
+        '''
+        This classifier takes as input MVTS from Turbofan dataset and returns a value corresponding the state
+        in which this time series is in that moment.
+        '''
+        def __init__(self, pca_fitted, projection_pc, projection_proto, line, encoder,test_points):
+            '''
+            pca: principal components of encoded training features
+            projection_pc: projection of encoded
+            '''
+            self.encoder = encoder
+            self.pca_fitted = pca_fitted
+            self.projection_pc = projection_pc
+            self.projection_proto = projection_proto
+            self.line = line
+            self.test_points = test_points
+            
+            
+        def softmax(self,x, axis = 0):
+            e_x = np.exp(x - np.max(x, axis = axis, keepdims = True))
+            return e_x / e_x.sum(axis, keepdims = True)
+        
+        def compute_distance_value(self,prototypes,point):
+            n_prototypes = len(prototypes)
+            distance_values = np.zeros(len(prototypes))
+            for i in range(len(prototypes)):
+                dist = np.abs(prototypes[i]-point)
+                distance_values[i] = 1/dist[0]
+            return self.softmax(distance_values)
+        
+        def classifier(self,projected_points):
+            probs = np.zeros((projected_points.shape[0],self.projection_proto.shape[0]))
+            predicted_labels = np.zeros(projected_points.shape[0])
+            for i in range(projected_points.shape[0]):
+                probs[i,:] = self.compute_distance_value(self.projection_proto,projected_points[i])
+                predicted_labels[i] = np.argmax(probs[i,:])
+            return probs, predicted_labels
+        
+        def orthogonal_projection(self,pt):
+            point = Point(pt[0], pt[1])
+            x = np.array(point.coords[0])
+            n = self.v - self.u
+            n /= np.linalg.norm(n, 2)
+            P = self.u + n*np.dot(x - self.u, n)
+
+            return P
+        
+        def main(self,):
+            z = self.encoder.predict(self.test_points)
+            z_pca = self.pca_fitted.fit_transform(z)
+            self.u = np.array(line.coords[0])
+            self.v = np.array(line.coords[len(line.coords)-1])
+            projection_z_pca = np.apply_along_axis(self.orthogonal_projection, 1, z_pca[:,0:2])
+            probs, preds = self.classifier(projection_z_pca)
+            return probs, preds, projection_z_pca,z_pca,z
+
+
+
+
+    def predictor(pca_fitted, projection_pc, projection_prototypes, line, encoder,test_points):
+        test = TubofanUnsupervisedClassifier(pca_fitted, projection_pc, projection_prototypes, line, encoder,test_points)
+        probs, preds, projection_z_pca,z_pca = test.main()
+        return probs, preds, projection_z_pca,z_pca,z
 class CounterFactualProto(Explainer, FitMixin):
 
     def __init__(self,
-                 predict: predictor #Union[Callable, tf.keras.Model, 'keras.Model'],
+                 predict, #Union[Callable, tf.keras.Model, 'keras.Model'],
                  shape: tuple,
                  kappa: float = 0.,
                  beta: float = .1,
@@ -192,7 +346,7 @@ class CounterFactualProto(Explainer, FitMixin):
         else:
             self.ae_model = False
 
-        if use_kdtree and self.enc_model:
+        # if use_kdtree and self.enc_model:
             # logger.warning('Both an encoder and k-d trees enabled. Using the encoder for the prototype loss term.')
 
         if use_kdtree or self.enc_model:
@@ -240,7 +394,7 @@ class CounterFactualProto(Explainer, FitMixin):
             self.max_cat = cat_vars[max_key]
             cat_keys = list(cat_vars.keys())
             n_cat = len(cat_keys)
-            self.assign_map = tf.placeholder(tf.float32, (n_cat, self.max_cat), name='assign_map')
+            self.assign_map = tf.compat.v1.placeholder(tf.float32, (n_cat, self.max_cat), name='assign_map')
             self.map_var = tf.Variable(np.zeros((n_cat, self.max_cat)), dtype=tf.float32, name='map_var')
 
             # update ragged mapping tensor
@@ -537,12 +691,12 @@ class CounterFactualProto(Explainer, FitMixin):
         self.global_step = tf.Variable(0.0, trainable=False, name='global_step')
 
         # define placeholders that will be assigned to relevant variables
-        self.assign_orig = tf.placeholder(tf.float32, shape, name='assign_orig')
-        self.assign_adv = tf.placeholder(tf.float32, shape, name='assign_adv')
-        self.assign_adv_s = tf.placeholder(tf.float32, shape, name='assign_adv_s')
-        self.assign_target = tf.placeholder(tf.float32, (self.batch_size, self.classes), name='assign_target')
-        self.assign_const = tf.placeholder(tf.float32, [self.batch_size], name='assign_const')
-        self.assign_target_proto = tf.placeholder(tf.float32, self.shape_enc, name='assign_target_proto')
+        self.assign_orig = tf.compat.v1.placeholder(tf.float32, shape, name='assign_orig')
+        self.assign_adv = tf.compat.v1.placeholder(tf.float32, shape, name='assign_adv')
+        self.assign_adv_s = tf.compat.v1.placeholder(tf.float32, shape, name='assign_adv_s')
+        self.assign_target = tf.compat.v1.placeholder(tf.float32, (self.batch_size, self.classes), name='assign_target')
+        self.assign_const = tf.compat.v1.placeholder(tf.float32, [self.batch_size], name='assign_const')
+        self.assign_target_proto = tf.compat.v1.placeholder(tf.float32, self.shape_enc, name='assign_target_proto')
 
         # define conditions and values for element-wise shrinkage thresholding
         with tf.name_scope('shrinkage_thresholding') as scope:
@@ -564,8 +718,8 @@ class CounterFactualProto(Explainer, FitMixin):
 
         # assign counterfactual of step k+1 to k
         with tf.name_scope('update_adv') as scope:
-            self.adv_updater = tf.assign(self.adv, self.assign_adv)
-            self.adv_updater_s = tf.assign(self.adv_s, self.assign_adv_s)
+            self.adv_updater = tf.compat.v1.assign(self.adv, self.assign_adv)
+            self.adv_updater_s = tf.compat.v1.assign(self.adv_s, self.assign_adv_s)
 
         # from perturbed instance, derive deviation delta
         with tf.name_scope('update_delta') as scope:
@@ -613,7 +767,7 @@ class CounterFactualProto(Explainer, FitMixin):
 
         with tf.name_scope('loss_attack') as scope:
             if not self.model:
-                self.loss_attack = tf.placeholder(tf.float32)
+                self.loss_attack = tf.compat.v1.placeholder(tf.float32)
             elif self.c_init == 0. and self.c_steps == 1:  # prediction loss term not used
                 # make predictions on perturbed instance
                 self.pred_proba, _, _, _, _ = self.predict(self.pca_fitted, self.projection_pc, self.projection_prototypes, self.line, self.encoder,self.ad_cat)
@@ -669,19 +823,19 @@ class CounterFactualProto(Explainer, FitMixin):
                                tf.multiply(self.beta, self.loss_l1) + self.loss_proto)
 
         with tf.name_scope('training') as scope:
-            self.learning_rate = tf.train.polynomial_decay(learning_rate_init, self.global_step,
+            self.learning_rate = tf.compat.v1.train.polynomial_decay(learning_rate_init, self.global_step,
                                                            self.max_iterations, 0, power=0.5)
-            optimizer = tf.train.GradientDescentOptimizer(self.learning_rate)
-            start_vars = set(x.name for x in tf.global_variables())
+            optimizer = tf.train.compat.v1.GradientDescentOptimizer(self.learning_rate)
+            start_vars = set(x.name for x in tf.compat.v1.global_variables())
 
             # first compute, then apply grads
             self.compute_grads = optimizer.compute_gradients(self.loss_opt, var_list=[self.adv_s])
-            self.grad_ph = tf.placeholder(tf.float32, name='grad_adv_s')
-            var = [tvar for tvar in tf.trainable_variables() if tvar.name.startswith('adv_s')][-1]  # get the last in
+            self.grad_ph = tf.compat.v1.placeholder(tf.float32, name='grad_adv_s')
+            var = [tvar for tvar in tf.compat.v1.trainable_variables() if tvar.name.startswith('adv_s')][-1]  # get the last in
             # case explainer is re-initialized and a new graph is created
             grad_and_var = [(self.grad_ph, var)]
             self.apply_grads = optimizer.apply_gradients(grad_and_var, global_step=self.global_step)
-            end_vars = tf.global_variables()
+            end_vars = tf.compat.v1.global_variables()
             new_vars = [x for x in end_vars if x.name not in start_vars]
 
         # variables to initialize
@@ -695,7 +849,7 @@ class CounterFactualProto(Explainer, FitMixin):
         if self.is_cat:
             self.setup.append(self.map_var.assign(self.assign_map))
 
-        self.init = tf.variables_initializer(var_list=[self.global_step] + [self.adv_s] + [self.adv] + new_vars)
+        self.init = tf.compat.v1.variables_initializer(var_list=[self.global_step] + [self.adv_s] + [self.adv] + new_vars)
 
         if self.write_dir is not None:
             self.writer = tf.summary.FileWriter(write_dir, tf.get_default_graph())
@@ -706,7 +860,7 @@ class CounterFactualProto(Explainer, FitMixin):
 
 
     def fit(self, train_data: np.ndarray, trustscore_kwargs: dict = None, d_type: str = 'abdm',
-            w: float = None, disc_perc: Sequence[Union[int, float]] = (25, 50, 75), standardize_cat_vars: bool = False,
+            w: float = None, disc_perc = [0,1], standardize_cat_vars: bool = False,
             smooth: float = 1., center: bool = True, update_feature_range: bool = True) -> "CounterFactualProto":
         """
         Get prototypes for each class using the encoder or k-d trees.
@@ -843,17 +997,17 @@ class CounterFactualProto(Explainer, FitMixin):
                 self.class_enc[i] = enc_data[idx]
 
 
-        elif self.use_kdtree:
-            # logger.warning('No encoder specified. Using k-d trees to represent class prototypes.')
-            if trustscore_kwargs is not None:
-                ts = TrustScore(**trustscore_kwargs)
-            else:
-                ts = TrustScore()
-            if self.is_cat:  # map categorical to numerical data
-                train_data = ord_to_num(train_data_ord, self.d_abs)
-            ts.fit(train_data, preds, classes=self.classes)
-            self.kdtrees = ts.kdtrees
-            self.X_by_class = ts.X_kdtree
+        # elif self.use_kdtree:
+        #     # logger.warning('No encoder specified. Using k-d trees to represent class prototypes.')
+        #     if trustscore_kwargs is not None:
+        #         ts = TrustScore(**trustscore_kwargs)
+        #     else:
+        #         ts = TrustScore()
+        #     if self.is_cat:  # map categorical to numerical data
+        #         train_data = ord_to_num(train_data_ord, self.d_abs)
+        #     ts.fit(train_data, preds, classes=self.classes)
+        #     self.kdtrees = ts.kdtrees
+        #     self.X_by_class = ts.X_kdtree
 
         return self
 
@@ -988,7 +1142,7 @@ class CounterFactualProto(Explainer, FitMixin):
         elif self.use_kdtree:
             dist_adv = self.kdtrees[adv_class].query(X, k=1)[0]
             dist_orig = self.kdtrees[orig_class].query(X, k=1)[0]
-        else:
+        # else:
             # logger.warning('Need either an encoder or the k-d trees enabled to compute distance scores.')
         return dist_orig / (dist_adv + eps)
 
@@ -1361,7 +1515,7 @@ class CounterFactualProto(Explainer, FitMixin):
         for key in remove:
             params.pop(key)
 
-        if X.shape[0] != 1:
+        # if X.shape[0] != 1:
             # logger.warning('Currently only single instance explanations supported (first dim = 1), '
                            # 'but first dim = %s', X.shape[0])
 
@@ -1554,19 +1708,6 @@ def main():
 
         return rnn_layer
 
-    n_sensors = 15
-    time_steps = 30
-    window_length = 30
-    batch_size = 64
-    rnn_layer_type = 'LSTM'
-    n_units = 32
-    n_epochs = 1500
-    learning_rate = 0.0001
-
-    encoder, ae = generate_LSTM_Autoencoder_with_Attention(time_steps,n_units,learning_rate,window_length)
-    ae = load_model('/data/jlabaien/PHD/Turbofan/Model/lstmAEwithATT_model.h5')
-    encoder.set_weights(ae.get_weights()[:3])
-
     class GetProjectionsTrain():
         
         def __init__(self, n_groups, z_path = '/data/jlabaien/PHD/Turbofan/Model/LatentSpace_unsupervised_attAE.h5', plot_space = True):
@@ -1713,8 +1854,18 @@ def main():
             projection_z_pca = np.apply_along_axis(self.orthogonal_projection, 1, z_pca[:,0:2])
             probs, preds = self.classifier(projection_z_pca)
             return probs, preds, projection_z_pca,z_pca,z
+    n_sensors = 15
+    time_steps = 30
+    window_length = 30
+    batch_size = 64
+    rnn_layer_type = 'LSTM'
+    n_units = 32
+    n_epochs = 1500
+    learning_rate = 0.0001
 
-
+    encoder, ae = generate_LSTM_Autoencoder_with_Attention(time_steps,n_units,learning_rate,window_length)
+    ae = load_model('/data/jlabaien/PHD/Turbofan/Model/lstmAEwithATT_model.h5')
+    encoder.set_weights(ae.get_weights()[:3])
     data_path = '/data/jlabaien/PHD/Turbofan/AllData_FD001_4_splits.h5'
 
     with h5py.File(data_path, 'r') as hf:
