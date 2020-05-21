@@ -32,7 +32,7 @@ def _check_keras_or_tf(predict_fn: Union[Callable, tf.keras.Model, 'keras.Model'
         import keras  # noqa
         sys.stderr = stderr
 
-        ksess = keras.backend.get_session()
+        ksess = tf.compat.v1.keras.backend.get_session()
         is_model = isinstance(predict_fn, keras.Model)
         if is_model:
             #  keras model, return keras session
